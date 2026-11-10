@@ -1,0 +1,543 @@
+---
+title: "Gasoline Prices: Cleaning and Exploratory Analysis"
+output: html_document
+---
+
+Only the supplied local retail and FRED spot data are used. No futures.
+The supplied files are read directly from `data/` and are not modified.
+This report covers cleaning and EDA only; forecasting choices are reserved for
+seminar discussion. A calendar week is the unit of observation throughout.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.path = "output/eda_", dev = "png", dpi = 120)
+dir.create("output", showWarnings = FALSE)
+```
+
+## 1. Read data
+
+```{r}
+local <- read.csv("data/binghamton_weekly.csv")
+wti <- read.csv("data/WCOILWTICO.csv")
+brent <- read.csv("data/WCOILBRENTEU.csv")
+rbob <- read.csv("data/WRGASLA.csv")
+
+# Keep Binghamton only; the file contains other regions too.
+local <- local[, c("date", "binghamton_average_gal")]
+names(local) <- c("date", "local_price")
+names(rbob) <- c("date", "rbob")
+```
+
+Local and RBOB prices: USD/gallon. WTI and Brent: USD/barrel.
+RBOB is the Los Angeles spot series WRGASLA.
+
+The averaging conventions differ:
+
+- **Local retail:** a regional average of posted prices observed on Mondays,
+  rather than an average of all seven days.
+- **FRED spot:** weekly averages of available daily spot closing prices,
+  dated at the Friday week-end.
+
+These are observation/period dates, **not confirmed publication dates**.
+Source definitions: [NYSERDA retail methodology](https://www.nyserda.ny.gov/Energy-Prices/Motor-Gasoline/Weekly-Average-Motor-Gasoline-Prices)
+and [EIA weekly spot methodology](https://www.eia.gov/dnav/pet/pet_pri_spt_s1_w.htm).
+
+## 2. Convert dates and sort
+
+```{r}
+# Remove the time part from the local dates.
+local$date <- as.Date(substr(local$date, 1, 10))
+wti$date <- as.Date(wti$date)
+brent$date <- as.Date(brent$date)
+rbob$date <- as.Date(rbob$date)
+
+local <- local[order(local$date), ]
+wti <- wti[order(wti$date), ]
+brent <- brent[order(brent$date), ]
+rbob <- rbob[order(rbob$date), ]
+
+str(local)
+str(wti)
+str(brent)
+str(rbob)
+```
+
+## 3. Check missing values and duplicate dates
+
+```{r}
+colSums(is.na(local))
+colSums(is.na(wti))
+colSums(is.na(brent))
+colSums(is.na(rbob))
+
+sum(duplicated(local$date))
+sum(duplicated(wti$date))
+sum(duplicated(brent$date))
+sum(duplicated(rbob$date))
+
+# Stop for review if dates repeat or existing rows contain missing values.
+stopifnot(!anyNA(local), !anyNA(wti), !anyNA(brent), !anyNA(rbob))
+stopifnot(!anyDuplicated(local$date), !anyDuplicated(wti$date),
+          !anyDuplicated(brent$date), !anyDuplicated(rbob$date))
+```
+
+An absent week is different from an empty cell. Check both.
+
+```{r}
+local_weeks <- seq(min(local$date), max(local$date), by = "week")
+wti_weeks <- seq(min(wti$date), max(wti$date), by = "week")
+brent_weeks <- seq(min(brent$date), max(brent$date), by = "week")
+rbob_weeks <- seq(min(rbob$date), max(rbob$date), by = "week")
+
+local_weeks[!local_weeks %in% local$date]
+wti_weeks[!wti_weeks %in% wti$date]
+brent_weeks[!brent_weeks %in% brent$date]
+rbob_weeks[!rbob_weeks %in% rbob$date]
+```
+
+Local data are missing December 30, 2024. Spot series have no missing weeks
+within their own ranges. Do not fill values or delete unusual prices yet.
+
+## 4. Merge spot prices
+
+The three spot series have Friday dates. Join on those dates.
+`all = TRUE` keeps all dates, even if a series has no value.
+
+```{r}
+spot <- merge(wti, brent, by = "date", all = TRUE)
+spot <- merge(spot, rbob, by = "date", all = TRUE)
+names(spot)[1] <- "spot_date"
+head(spot)
+summary(spot)
+```
+
+## 5. Exploratory alignment with local prices
+
+Local dates are Mondays; spot dates mark weeks ending Fridays. We first pair
+each Monday with the preceding Friday for descriptive comparisons. This retains
+the original observation dates in separate columns; it does not change prices.
+This is **not yet prediction-ready** because release timing is unverified.
+
+```{r}
+# Keep every Monday, including the missing local week.
+calendar <- data.frame(date = local_weeks)
+combined <- merge(calendar, local, by = "date", all.x = TRUE)
+combined$spot_date <- combined$date - 3
+combined <- merge(combined, spot, by = "spot_date", all.x = TRUE)
+combined <- combined[order(combined$date), ]
+combined <- combined[, c("date", "spot_date", "local_price", "wti", "brent", "rbob")]
+
+head(combined)
+colSums(is.na(combined))
+
+# Inspect incomplete rows; do not delete them.
+combined[!complete.cases(combined), ]
+sum(complete.cases(combined))
+```
+
+## 6. Save
+
+```{r}
+dir.create("data/clean", recursive = TRUE, showWarnings = FALSE)
+write.csv(local, "data/clean/binghamton_clean.csv", row.names = FALSE)
+write.csv(wti, "data/clean/wti_clean.csv", row.names = FALSE)
+write.csv(brent, "data/clean/brent_clean.csv", row.names = FALSE)
+write.csv(rbob, "data/clean/rbob_la_clean.csv", row.names = FALSE)
+write.csv(spot, "data/clean/spot_weekly_clean.csv", row.names = FALSE)
+write.csv(combined, "data/clean/local_spot_exploratory_alignment.csv",
+          row.names = FALSE, na = "")
+```
+
+No price values have been changed or filled. Keep the full history for now;
+choose the training period later.
+
+## 7. Price levels over time
+
+Separate panels keep the original units visible. Missing weeks remain gaps.
+
+```{r time-trends, fig.width=10, fig.height=7}
+knitr::opts_chunk$set(fig.path = "output/eda_", dev = "png", dpi = 120)
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+plot(combined$date, combined$local_price, type = "l", col = "steelblue",
+     main = "Binghamton retail", xlab = "Year", ylab = "USD/gallon")
+plot(combined$date, combined$wti, type = "l", col = "darkorange",
+     main = "WTI spot", xlab = "Year", ylab = "USD/barrel")
+plot(combined$date, combined$brent, type = "l", col = "darkgreen",
+     main = "Brent spot", xlab = "Year", ylab = "USD/barrel")
+plot(combined$date, combined$rbob, type = "l", col = "purple",
+     main = "Los Angeles RBOB spot", xlab = "Year", ylab = "USD/gallon")
+```
+
+## 8. Week-to-week price changes
+
+Subtract the previous week's price. If either week is missing, the change stays
+missing. This avoids calculating a two-week change across the missing local week.
+
+```{r weekly-changes, fig.width=10, fig.height=7}
+changes <- data.frame(
+  date = combined$date,
+  local_price = c(NA, diff(combined$local_price)),
+  wti = c(NA, diff(combined$wti)),
+  brent = c(NA, diff(combined$brent)),
+  rbob = c(NA, diff(combined$rbob))
+)
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+plot(changes$date, changes$local_price, type = "l", col = "steelblue",
+     main = "Binghamton weekly change", xlab = "Year", ylab = "USD/gallon change")
+abline(h = 0, col = "gray")
+plot(changes$date, changes$wti, type = "l", col = "darkorange",
+     main = "WTI weekly change", xlab = "Year", ylab = "USD/barrel change")
+abline(h = 0, col = "gray")
+plot(changes$date, changes$brent, type = "l", col = "darkgreen",
+     main = "Brent weekly change", xlab = "Year", ylab = "USD/barrel change")
+abline(h = 0, col = "gray")
+plot(changes$date, changes$rbob, type = "l", col = "purple",
+     main = "RBOB weekly change", xlab = "Year", ylab = "USD/gallon change")
+abline(h = 0, col = "gray")
+```
+
+## 9. Correlation: price levels versus weekly changes
+
+Use a common complete sample within each table. Level correlations may reflect
+shared trends. Change correlations describe weekly movements more directly.
+Neither establishes causality or guarantees forecast improvement.
+
+```{r correlation}
+price_columns <- c("local_price", "wti", "brent", "rbob")
+level_cor <- cor(combined[, price_columns], use = "complete.obs")
+change_cor <- cor(changes[, price_columns], use = "complete.obs")
+
+knitr::kable(round(level_cor, 3), caption = "Correlation of price levels")
+knitr::kable(round(change_cor, 3), caption = "Correlation of weekly changes")
+```
+
+## 10. Time lag: do spot movements lead local movements?
+
+### Why examine time lags?
+
+Upstream and retail prices may adjust at different times. This EDA asks whether
+local weekly changes are more closely associated with the nearest spot-week
+change or with an earlier spot-week change. It describes timing in historical
+observations; it does not estimate a causal transmission delay, select regression
+coefficients, or determine the forecast horizon.
+
+### Exactly what do lag 0, lag 1, and lag 2 mean here?
+
+**Lag k means k additional weekly shifts after the initial Monday/Friday pairing.**
+For a local observation on Monday 2024-06-17:
+
+| Plot label | Local observation | Spot week ending | Date-label gap |
+|---|---|---|---|
+| Lag 0 | Mon 2024-06-17 | Fri 2024-06-14 | 3 days |
+| Lag 1 | Mon 2024-06-17 | Fri 2024-06-07 | 10 days |
+| Lag 2 | Mon 2024-06-17 | Fri 2024-05-31 | 17 days |
+
+We correlate **changes**, not single prices. For example, lag 1 pairs the local
+change from June 10 to June 17 with the spot-week-average change from the week
+ending May 31 to the week ending June 7.
+
+The general date-label gap is **3 + 7k days**. Ten days does not mean ten daily
+observations, a ten-day training window, or a ten-day forecast. Each lag uses
+hundreds of historical weekly pairs across the available years. The Friday is
+an entire weekly average's end date, not an instantaneous Friday-only price or
+a release date. These chart definitions differ from local-price ACF lags, where
+lag 1 simply means seven days between two Monday observations.
+
+```{r lag-correlation, fig.width=10, fig.height=5}
+lag_results <- data.frame()
+
+for (market in c("wti", "brent", "rbob")) {
+  for (k in 0:8) {
+    # Shift the spot-change column down by k weeks.
+    earlier_spot <- changes[[market]]
+    if (k > 0) {
+      earlier_spot <- c(rep(NA, k), head(earlier_spot, -k))
+    }
+    usable <- complete.cases(changes$local_price, earlier_spot)
+    r <- cor(changes$local_price[usable], earlier_spot[usable])
+    lag_results <- rbind(lag_results,
+      data.frame(market = market, lag_weeks = k, date_gap_days = 3 + 7*k, correlation = r,
+                 pairs = sum(usable)))
+  }
+}
+
+plot(0:8, lag_results$correlation[lag_results$market == "wti"],
+     type = "b", pch = 16, col = "darkorange", ylim = c(-1, 1), xaxt = "n",
+     xlab = "Additional weekly lag / date-label gap in days",
+     ylab = "Correlation of weekly changes", main = "Earlier spot changes vs. local changes")
+axis(1, at = 0:8, labels = paste0("Lag ", 0:8, "\n", 3 + 7*(0:8), " days"))
+lines(0:8, lag_results$correlation[lag_results$market == "brent"],
+      type = "b", pch = 17, col = "darkgreen")
+lines(0:8, lag_results$correlation[lag_results$market == "rbob"],
+      type = "b", pch = 15, col = "purple")
+abline(h = 0, col = "gray", lty = 2)
+legend("topright", c("WTI", "Brent", "RBOB (LA)"),
+       col = c("darkorange", "darkgreen", "purple"), pch = c(16, 17, 15), bty = "n")
+knitr::kable(lag_results, digits = 3)
+```
+
+In this sample, all three markets have their largest absolute correlation among
+lags 0–8 at **lag 1**. The correlations are about 0.45 for WTI and Brent, and
+0.33 for Los Angeles RBOB. Under our calendar pairing, lag 1 uses the spot week
+ending **10 days before** the Monday local observation, not simply one day or
+one calendar week before it. These are exploratory associations; market changes
+may persist across weeks and the strongest association can change by period.
+The graph provides candidate timing relationships for later discussion, not a
+chosen model. It does not show that lag 1 contributes information after controlling
+for local history and seasonality. Pair counts vary slightly across lags and are
+reported in the table; small differences in correlations should not be overread.
+
+## 11. Local-price autocorrelation
+
+ACF shows how the local series relates to its own past. The change-series plot
+helps distinguish persistence in movements from persistence in price levels.
+The dashed bounds are a rough white-noise reference, not a formal test of
+forecasting ability. Missing calendar weeks are kept in place.
+
+```{r autocorrelation, fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+acf(combined$local_price, lag.max = 12, na.action = na.pass,
+    main = "Local price ACF", xlab = "Lag (weeks)")
+acf(changes$local_price, lag.max = 12, na.action = na.pass,
+    main = "Local weekly-change ACF", xlab = "Lag (weeks)")
+```
+
+All plots are exploratory and use the full supplied history. A lag selected here
+must be re-evaluated using chronological validation on training data only.
+Publication delays still need verification before forecasting.
+
+```{r save-eda}
+write.csv(changes, "output/weekly_price_changes.csv", row.names = FALSE, na = "")
+write.csv(level_cor, "output/level_correlations.csv")
+write.csv(change_cor, "output/change_correlations.csv")
+write.csv(lag_results, "output/lag_correlations.csv", row.names = FALSE)
+```
+
+
+## 12. Seasonal patterns
+
+### Question and preparation
+
+Does the same part of the year tend to have higher or lower local prices?
+A one-time jump in 2022 is not itself seasonality: seasonal patterns should
+recur across years.
+
+Use 2017–2025, the complete **calendar-year spans** in the supplied data; the
+missing December 2024 week remains absent. Exclude partial-year 2026 only from
+this seasonal comparison, not from the earlier EDA.
+
+Subtract each year's observed mean to reduce differences in price levels between
+years. Then calculate monthly means and give each year equal weight. This is a
+retrospective display transformation, not a change to the saved clean prices.
+It does not remove within-year trends or shocks.
+
+```{r seasonal-data}
+seasonal <- local
+seasonal$year <- as.integer(format(seasonal$date, "%Y"))
+seasonal$month <- as.integer(format(seasonal$date, "%m"))
+seasonal <- seasonal[seasonal$year <= 2025, ]
+seasonal$relative_price <- seasonal$local_price -
+  ave(seasonal$local_price, seasonal$year, FUN = mean)
+
+monthly <- aggregate(relative_price ~ year + month, seasonal, mean)
+monthly_average <- aggregate(relative_price ~ month, monthly, mean)
+knitr::kable(monthly_average, digits = 3,
+             caption = "Monthly deviation from annual mean (USD/gallon)")
+```
+
+```{r seasonal-patterns, fig.width=10, fig.height=8}
+par(mfrow = c(2, 1), mar = c(4, 5, 3, 1))
+colors <- hcl.colors(9, "Dark 3")
+plot(1:12, rep(0, 12), type = "n", ylim = range(monthly$relative_price),
+     xaxt = "n", xlab = "Month", ylab = "USD/gallon relative to annual mean",
+     main = "Binghamton: monthly patterns by year, 2017–2025")
+axis(1, at = 1:12, labels = month.abb)
+abline(h = 0, col = "gray65", lty = 2)
+for (year in 2017:2025) {
+  d <- monthly[monthly$year == year, ]
+  lines(d$month, d$relative_price, col = colors[year - 2016])
+}
+lines(1:12, monthly_average$relative_price, lwd = 3, col = "black")
+legend("topleft", c(as.character(2017:2025), "Average"),
+       col = c(colors, "black"), lty = 1, ncol = 5, cex = 0.7, bty = "n")
+
+boxplot(relative_price ~ month, data = monthly, names = month.abb,
+        col = "lightblue", xlab = "Month",
+        ylab = "USD/gallon relative to annual mean",
+        main = "Distribution across years: nine monthly means per month")
+abline(h = 0, col = "gray65", lty = 2)
+lines(1:12, monthly_average$relative_price, type = "b", col = "firebrick", pch = 16)
+legend("topleft", "Mean across years", col = "firebrick", lty = 1, pch = 16, bty = "n")
+```
+
+### Interpretation
+
+- January–February average about $0.16–$0.18 below their annual mean, whereas
+  May–August average about $0.09–$0.12 above it. This suggests a winter-low,
+  summer-high pattern in price **levels**.
+- The year-by-year lines and boxplots show substantial variation. In particular,
+  2022 has a large within-year rise and fall; the average is not a rule followed
+  equally in every year. This is evidence of a possible pattern, not a formal
+  estimate of a seasonal or causal effect.
+- Annual seasonality is compatible with weekly observations: each weekly date
+  occupies a position within an annual cycle of approximately 52 weeks.
+- A higher summer price does not imply that prices rise every summer week.
+  Examine weekly changes separately before interpreting seasonality in changes.
+
+### Are weekly increases also seasonal?
+
+Group the local weekly changes by the **later week's month**, using 2017–2025.
+Changes adjacent to the missing week remain missing; no values are filled.
+Year-specific monthly averages give each year equal weight and show variation
+rather than treating all weeks as independent evidence.
+
+```{r seasonal-changes, fig.width=9, fig.height=4}
+seasonal_changes <- changes[, c("date", "local_price")]
+seasonal_changes$year <- as.integer(format(seasonal_changes$date, "%Y"))
+seasonal_changes$month <- as.integer(format(seasonal_changes$date, "%m"))
+seasonal_changes <- seasonal_changes[seasonal_changes$year <= 2025, ]
+monthly_changes <- aggregate(local_price ~ year + month, seasonal_changes, mean)
+mean_changes <- aggregate(local_price ~ month, monthly_changes, mean)
+
+boxplot(local_price ~ month, data = monthly_changes, names = month.abb,
+        col = "wheat", xlab = "Month", ylab = "Mean weekly change (USD/gallon)",
+        main = "Local weekly changes by month: variation across years")
+abline(h = 0, lty = 2, col = "gray")
+lines(1:12, mean_changes$local_price, type = "b", pch = 16, col = "firebrick")
+knitr::kable(mean_changes, digits = 3, caption = "Average weekly change by month")
+
+write.csv(monthly, "output/seasonality_monthly_by_year.csv", row.names = FALSE)
+write.csv(monthly_average, "output/seasonality_monthly_average.csv", row.names = FALSE)
+write.csv(monthly_changes, "output/seasonality_changes_by_year.csv", row.names = FALSE)
+```
+
+Positive and negative year-specific monthly changes overlap in many months.
+The pattern in price levels is therefore easier to see than a stable month-by-month
+rule for price changes. Market shocks can dominate seasonal averages. These plots
+motivate further investigation; they do not establish forecast improvement.
+Annual means calculated using a full year are only for retrospective EDA and
+must not be used as if known during that year.
+
+## 13. Do upstream–local relationships change over time?
+
+Earlier sections summarize the whole sample. They do not show whether the
+relationships are stable over time. We now compare **weekly changes**, which
+are less dominated by common price-level trends. These are descriptive Pearson
+correlations, not causal effects or estimated forecasting performance.
+
+### Annual correlations
+
+Keep the same Monday/preceding-Friday alignment (lag 0) in every year. Also show
+lag 1, the additional one-week shift, as a sensitivity check. Missing weeks stay
+on the calendar before shifting. Correlation is reported only with at least
+30 valid pairs. The final year, 2026, is incomplete and is not directly comparable
+to a full calendar year.
+
+```{r annual-relationships}
+years <- as.integer(format(changes$date, "%Y"))
+annual_cor <- data.frame()
+for (market in c("wti", "brent", "rbob")) {
+  for (lag in 0:1) {
+    upstream <- changes[[market]]
+    if (lag == 1) upstream <- c(NA, head(upstream, -1))
+    for (year in sort(unique(years))) {
+      ok <- years == year & complete.cases(changes$local_price, upstream)
+      r <- NA_real_
+      if (sum(ok) >= 30) r <- cor(changes$local_price[ok], upstream[ok])
+      annual_cor <- rbind(annual_cor,
+        data.frame(market = market, lag = lag, year = year,
+                   pairs = sum(ok), correlation = r))
+    }
+  }
+}
+knitr::kable(annual_cor, digits = 3)
+```
+
+### Rolling two-year correlations
+
+Each point uses the preceding **104 calendar weeks**, including the plotted
+week. Adjacent windows overlap heavily; fluctuations are not independent tests
+of structural change. We keep lag 0 fixed to make windows comparable and require
+at least 90 complete pairs within a window. Two years gives more observations
+than a single year while still revealing gradual changes.
+
+```{r rolling-relationships, fig.width=10, fig.height=7}
+rolling_cor <- data.frame(date = changes$date, wti = NA_real_,
+                          brent = NA_real_, rbob = NA_real_)
+for (market in c("wti", "brent", "rbob")) {
+  for (i in 104:nrow(changes)) {
+    window <- changes[(i-103):i, ]
+    ok <- complete.cases(window$local_price, window[[market]])
+    if (sum(ok) >= 90) {
+      rolling_cor[i, market] <- cor(window$local_price[ok], window[[market]][ok])
+    }
+  }
+}
+par(mfrow = c(3, 1), mar = c(3, 4, 2, 1))
+for (market in c("wti", "brent", "rbob")) {
+  plot(rolling_cor$date, rolling_cor[[market]], type = "l", ylim = c(-1, 1),
+       col = "steelblue", xlab = "Window end date", ylab = "Correlation",
+       main = paste(toupper(market), "vs local weekly changes: trailing 104 weeks"))
+  abline(h = 0, lty = 2, col = "gray")
+}
+```
+
+### Whole history versus recent five years: descriptive comparison
+
+The recent-five-year period ends at the latest supplied local date. Both samples
+use lag 0, and neither is a training/test split. Similar average correlations
+can hide changes within the periods. A higher correlation is not evidence of
+better out-of-sample forecasts.
+
+```{r history-comparison}
+end_date <- max(combined$date)
+start_recent <- as.Date(paste0(as.integer(format(end_date, "%Y")) - 5,
+                              format(end_date, "-%m-%d")))
+period_cor <- data.frame()
+for (market in c("wti", "brent", "rbob")) {
+  for (period in c("All available", "Recent five years")) {
+    selected <- rep(TRUE, nrow(changes))
+    if (period == "Recent five years") selected <- changes$date > start_recent
+    ok <- selected & complete.cases(changes$local_price, changes[[market]])
+    period_cor <- rbind(period_cor,
+      data.frame(market = market, period = period, pairs = sum(ok),
+                 first_pair = min(changes$date[ok]), last_pair = max(changes$date[ok]),
+                 correlation = cor(changes$local_price[ok], changes[[market]][ok])))
+  }
+}
+knitr::kable(period_cor, digits = 3)
+write.csv(annual_cor, "output/annual_change_correlations.csv", row.names = FALSE)
+write.csv(rolling_cor, "output/rolling_104week_correlations.csv", row.names = FALSE, na = "")
+write.csv(period_cor, "output/history_window_correlations.csv", row.names = FALSE)
+```
+
+### Findings from the supplied data
+
+At lag 0, whole-history versus recent-five-year weekly-change correlations are
+0.376 versus 0.415 for WTI, 0.373 versus 0.395 for Brent, and 0.203 versus 0.208
+for Los Angeles RBOB. The differences in these aggregate summaries are modest.
+Annual estimates and rolling plots show larger variation within those periods:
+for example, WTI's annual correlation is 0.428 in 2022, 0.098 in 2024, and -0.041
+in 2025. Each annual estimate has only about 50 pairs, and 2026 has only 36.
+This is a reason to investigate stability, not proof that older data are useless
+or that the recent-five-year window is optimal.
+
+These comparisons can reveal varying associations, but cannot by themselves
+prove that the underlying economic relationship changed or decide a training
+window. Differences may reflect sample size, unusual periods, volatility,
+seasonality, or other variables. A later comparison should evaluate full-history
+and rolling-window models on the **same forecast dates** using information
+available at each date. No forecasting model is fitted in this EDA section.
+
+
+## 14. EDA takeaways
+
+- Prices share broad movements, but level correlations can reflect common trends.
+- Weekly-change correlations and calendar-preserving lags describe historical
+  timing more directly. Lag labels do not specify a training window or horizon.
+- WTI and Brent are strongly correlated with each other, so they may contain
+  overlapping information.
+- Seasonal displays suggest winter-low/summer-high local prices on average, with
+  substantial year-to-year differences. This is exploratory evidence only.
+- Missing values, source-date differences, and publication timing must remain
+  visible. Forecast horizons and model choices are outside this report's scope.

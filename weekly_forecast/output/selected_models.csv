@@ -1,0 +1,4 @@
+"model","id","features","window"
+"AR","AR_expanding_1","local0","expanding"
+"ARDL","ARDL_expanding_1_2_brent","local0 + brent0 + brent1 + rbob0 + rbob1","expanding"
+"ARDL_stocks","stocks_VLO_1","local0 + brent0 + brent1 + rbob0 + rbob1 + VLO0","expanding"

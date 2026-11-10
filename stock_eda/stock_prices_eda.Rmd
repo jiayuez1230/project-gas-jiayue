@@ -1,0 +1,221 @@
+---
+title: "Energy Company Stocks and Binghamton Gasoline Prices"
+output:
+  html_document:
+    toc: true
+---
+
+This exploration uses five preselected U.S. companies: ExxonMobil (XOM), Chevron
+(CVX), Marathon Petroleum (MPC), Valero (VLO), and Phillips 66 (PSX). The first
+two represent integrated oil businesses; the latter three represent refining and
+downstream businesses. This is a representative candidate set, not a top-five
+ranking or a selection based on observed correlations. Stocks are distinct
+predictors, not substitutes spliced into a futures-price series.
+
+## 1. Source and daily data checks
+
+Daily historical data were retrieved from Yahoo Finance on November 3, 2026.
+Raw responses, close, adjusted close, and corporate-action metadata are retained.
+Adjusted close is used for returns to account for splits and distributions.
+The download starts in December 2016 to support the first weekly return of 2017.
+It ends November 2, 2026. No credentials are required by the download script.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.path = "output/stock_", dev = "png", dpi = 120,
+                      fig.width = 9, fig.height = 5, message = FALSE)
+dir.create("data/clean", recursive = TRUE, showWarnings = FALSE)
+dir.create("output", showWarnings = FALSE)
+```
+
+```{r prepare-stocks}
+symbols <- c("XOM", "CVX", "MPC", "VLO", "PSX")
+stocks <- list()
+quality <- data.frame()
+for (symbol in symbols) {
+  raw <- jsonlite::fromJSON(paste0("data/raw/", symbol, ".json"),
+                           simplifyVector = FALSE)$chart$result[[1]]
+  number <- function(x) vapply(x, function(v) if (is.null(v)) NA_real_ else v, numeric(1))
+  time <- as.POSIXct(unlist(raw$timestamp), origin = "1970-01-01", tz = "UTC")
+  daily <- data.frame(date = as.Date(format(time, tz = "America/New_York", format = "%Y-%m-%d")),
+    close = number(raw$indicators$quote[[1]]$close),
+    adjusted_close = number(raw$indicators$adjclose[[1]]$adjclose))
+  daily <- daily[order(daily$date), ]
+  stopifnot(!anyDuplicated(daily$date), all(daily$adjusted_close > 0, na.rm = TRUE))
+  quality <- rbind(quality, data.frame(symbol = symbol, rows = nrow(daily),
+    first_date = min(daily$date), last_date = max(daily$date),
+    missing_close = sum(is.na(daily$close)),
+    missing_adjusted_close = sum(is.na(daily$adjusted_close))))
+  write.csv(daily, paste0("data/clean/", symbol, "_daily.csv"), row.names = FALSE)
+
+  # Keep the last observed trading day in each Monday–Friday week.
+  daily <- daily[!is.na(daily$adjusted_close), ]
+  day <- as.POSIXlt(daily$date)$wday
+  stopifnot(all(day %in% 1:5))
+  daily$week_end <- daily$date + 5 - day
+  weekly <- daily[!duplicated(daily$week_end, fromLast = TRUE), ]
+  # Exclude the unfinished week beginning November 2.
+  weekly <- weekly[weekly$week_end <= as.Date("2026-10-30"), ]
+  calendar <- data.frame(week_end = seq(min(weekly$week_end), max(weekly$week_end), by = "week"))
+  weekly <- merge(calendar, weekly, by = "week_end", all.x = TRUE, sort = TRUE)
+  weekly$log_return <- c(NA, diff(log(weekly$adjusted_close)))
+  weekly <- weekly[weekly$week_end >= as.Date("2017-01-01"), ]
+  stocks[[symbol]] <- weekly
+  write.csv(weekly, paste0("data/clean/", symbol, "_weekly.csv"), row.names = FALSE, na = "")
+}
+knitr::kable(quality)
+write.csv(quality, "output/data_quality.csv", row.names = FALSE)
+```
+
+Non-trading days are not missing daily observations. A holiday-shortened week
+uses its last actual trading day; both that date and the Friday week label are
+saved. Entire missing weeks would stay missing before returns are computed.
+Adjusted history can be revised by the provider; raw snapshots are retained for
+reproducibility. These are retrospective EDA data, not a vintage-correct backtest.
+
+## 2. Stock trends and returns
+
+For visual comparison only, adjusted prices are rebased to 100 at each stock's
+first observed week of 2017. This does not change the stored prices.
+
+```{r stock-trends}
+colors <- c("#20639B", "#D68100", "#238B45", "#9850A0", "#C43B3B")
+indexed <- sapply(stocks, function(x) 100*x$adjusted_close/x$adjusted_close[1])
+matplot(stocks[[1]]$week_end, indexed, type = "l", lty = 1, col = colors,
+        xlab = "Week ending", ylab = "Adjusted price index (first week = 100)",
+        main = "Five energy-company stocks")
+legend("topleft", symbols, col = colors, lty = 1, bty = "n")
+```
+
+```{r returns-table}
+returns <- data.frame(week_end = stocks[[1]]$week_end)
+for (symbol in symbols) {
+  d <- stocks[[symbol]][, c("week_end", "log_return")]
+  names(d)[2] <- symbol
+  returns <- merge(returns, d, by = "week_end", all = TRUE)
+}
+# Equal-weight average log-return signals, not tradable portfolio indices.
+returns$integrated_group <- (returns$XOM + returns$CVX)/2
+returns$refining_group <- (returns$MPC + returns$VLO + returns$PSX)/3
+knitr::kable(round(cor(returns[, symbols], use = "complete.obs"), 3),
+             caption = "Stock weekly log-return correlations")
+write.csv(returns, "data/clean/stock_weekly_returns.csv", row.names = FALSE, na = "")
+```
+
+## 3. Align with local weekly price changes
+
+The local file is copied unchanged from the supplied project data. Each Monday
+is paired with the preceding Friday's stock-week label. Stock returns compare
+successive weekly closes, not daily-average prices. Local changes compare
+successive Monday regional retail observations. Missing weeks are retained.
+
+```{r align-local}
+local <- read.csv("data/raw/binghamton_weekly.csv")
+local <- data.frame(date = as.Date(substr(local$date, 1, 10)),
+                    local_price = local$binghamton_average_gal)
+calendar <- data.frame(date = seq(min(local$date), max(local$date), by = "week"))
+local <- merge(calendar, local, by = "date", all.x = TRUE)
+local$local_change <- c(NA, diff(local$local_price))
+local$local_log_change <- c(NA, diff(log(local$local_price)))
+local$week_end <- local$date - 3
+combined <- merge(local, returns, by = "week_end", all.x = TRUE)
+combined <- combined[order(combined$date), ]
+stopifnot(all(diff(combined$date) == 7), !anyDuplicated(combined$date))
+write.csv(combined, "data/clean/local_stock_weekly.csv", row.names = FALSE, na = "")
+```
+
+## 4. Correlation and lag exploration
+
+First check price levels, as suggested by Christopher. Raw closing prices and
+adjusted closing prices are shown separately. These level correlations can be
+driven by shared trends and should not be interpreted as predictive evidence.
+
+```{r price-level-correlations}
+level_results <- data.frame()
+for (symbol in symbols) {
+  d <- merge(local, stocks[[symbol]][, c("week_end", "close", "adjusted_close")],
+             by = "week_end", all.x = TRUE)
+  ok <- complete.cases(d$local_price, d$close, d$adjusted_close)
+  level_results <- rbind(level_results, data.frame(symbol = symbol, pairs = sum(ok),
+    closing_price_correlation = cor(d$local_price[ok], d$close[ok]),
+    adjusted_price_correlation = cor(d$local_price[ok], d$adjusted_close[ok])))
+}
+knitr::kable(level_results, digits = 3, caption = "Price-level correlations at lag 0")
+write.csv(level_results, "output/stock_local_level_correlations.csv", row.names = FALSE)
+```
+
+Lag 0 pairs a Monday local change with the preceding stock week (Friday label
+3 days earlier). Lag 1 moves the stock return back one additional week (Friday
+label 10 days earlier), and so on. Actual last trading dates can precede Friday
+on holidays. This is not a forecast horizon or a training-window length.
+
+```{r lag-correlations}
+features <- c(symbols, "integrated_group", "refining_group")
+results <- data.frame()
+for (feature in features) {
+  for (lag in 0:4) {
+    x <- combined[[feature]]
+    if (lag > 0) x <- c(rep(NA, lag), head(x, -lag))
+    ok <- complete.cases(combined$local_change, combined$local_log_change, x)
+    results <- rbind(results, data.frame(feature = feature, lag = lag,
+      pairs = sum(ok), first_date = min(combined$date[ok]), last_date = max(combined$date[ok]),
+      change_correlation = cor(combined$local_change[ok], x[ok]),
+      log_change_correlation = cor(combined$local_log_change[ok], x[ok])))
+  }
+}
+knitr::kable(results[results$lag == 0, ], digits = 3,
+             caption = "Lag 0: stock returns versus local changes")
+write.csv(results, "output/stock_local_lag_correlations.csv", row.names = FALSE)
+```
+
+```{r lag-plot}
+plot(0:4, results$change_correlation[results$feature == "XOM"],
+     type = "n", ylim = c(-1, 1), xaxt = "n",
+     xlab = "Additional weekly lag / Friday-label gap",
+     ylab = "Correlation with local weekly price change",
+     main = "Do earlier stock returns relate to local changes?")
+axis(1, 0:4, paste0("Lag ", 0:4, "\n", 3+7*(0:4), " days"))
+for (i in seq_along(symbols)) {
+  d <- results[results$feature == symbols[i], ]
+  lines(d$lag, d$change_correlation, type = "b", pch = i, col = colors[i])
+}
+abline(h = 0, lty = 2, col = "gray")
+legend("topright", symbols, col = colors, pch = 1:5, lty = 1, bty = "n")
+```
+
+```{r scatterplots, fig.height=7, fig.width=10}
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+for (symbol in symbols) {
+  plot(combined[[symbol]], combined$local_change, pch = 16, cex = 0.5,
+       col = "#286A8B70", xlab = paste(symbol, "weekly log return"),
+       ylab = "Local change (USD/gallon)", main = paste(symbol, "lag 0"))
+  abline(h = 0, v = 0, col = "gray80")
+}
+```
+
+## 5. Interpretation and limits
+
+In this sample, lag-0 correlations between stock returns and local weekly changes
+are weak (about 0.04–0.11). Among the additional lags 0–4 explored, each company's
+largest absolute change correlation occurs at lag 1, about 0.20–0.24. This timing
+pattern is an exploratory association; it does not establish significance or
+forecast accuracy. These are stock-return versus local-change correlations, not
+stock-price-level correlations, and are not directly comparable to earlier spot
+results unless the sample dates and definitions are held fixed.
+
+The main question is whether equity returns provide useful information beyond
+local history and the already-collected spot series. Equity prices also reflect
+firm-specific news, distributions, and broader stock-market conditions. A
+correlation does not establish causality or additional forecasting value.
+
+Results use all historical pairs and several lags, so any apparent best feature
+or lag is exploratory, not a validated choice. Differences between highly
+correlated stocks may be unstable. Group signals are optional candidates.
+No model has been fitted or test set used to choose variables here. A later
+one-week-ahead evaluation must use only data available at the forecast origin
+and compare against local-history and local-plus-spot baselines on identical dates.
+
+Stock data: [Yahoo Finance XOM](https://finance.yahoo.com/quote/XOM/history/),
+[CVX](https://finance.yahoo.com/quote/CVX/history/),
+[MPC](https://finance.yahoo.com/quote/MPC/history/),
+[VLO](https://finance.yahoo.com/quote/VLO/history/),
+[PSX](https://finance.yahoo.com/quote/PSX/history/).
